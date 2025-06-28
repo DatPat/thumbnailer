@@ -1,5 +1,5 @@
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use anyhow::{Context, Result};
 use tempfile::tempdir;
@@ -47,6 +47,24 @@ fn get_video_duration(video_path: &str) -> Result<f64> {
     Ok(duration)
 }
 
+/// Check if the frame extracted at a timestamp is black using FFmpeg's blackframe filter.
+fn is_black_frame(video_path: &str, timestamp: f64) -> Result<bool> {
+    let output = Command::new("ffmpeg")
+        .args([
+            "-ss", &format!("{:.3}", timestamp),
+            "-i", video_path,
+            "-t", "1",
+            "-vf", "blackframe=99:32",
+            "-an",
+            "-f", "null",
+            "-",
+        ])
+        .output()
+        .with_context(|| "Failed to run ffmpeg for blackframe detection")?;
+
+    Ok(String::from_utf8_lossy(&output.stderr).contains("blackframe"))
+}
+
 /// Escape text for FFmpeg drawtext filter.
 fn escape_ffmpeg_drawtext_text(text: &str) -> String {
     text.replace('\\', "\\\\")
@@ -58,23 +76,47 @@ fn escape_ffmpeg_drawtext_text(text: &str) -> String {
 /// Main entry point.
 fn main() -> Result<()> {
     let args: Vec<String> = env::args().collect();
-    
+
     if args.len() < 2 {
-        eprintln!("Please provide a file name.");
+        eprintln!("Please provide a file or directory.");
         std::process::exit(1);
     }
-    
-    let input_video = &args[1]; // Adjust this path as needed
-    let output_image = format!("{}_tn.jpg", input_video);
-    let rows = 3;
-    let cols = 3;
-    let total_thumbs = rows * cols;
 
-    println!("Video Thumbnail Creator (C) 1994 by Trash Corp");
-    create_thumbnail_mosaic(&input_video, &output_image, rows, cols, total_thumbs)?;
-    println!("Mosaic created: {}", &output_image);
+    let input_path = Path::new(&args[1]);
+
+    if input_path.is_dir() {
+        for entry in fs::read_dir(input_path)? {
+            let path = entry?.path();
+            if path.is_file() && is_video_file(&path) {
+                let output_image = path.with_extension("jpg");
+                println!("Processing: {}", path.display());
+                if let Err(e) = create_thumbnail_mosaic(
+                    path.to_str().unwrap(),
+                    output_image.to_str().unwrap(),
+                    3, 3, 9
+                ) {
+                    eprintln!("Failed to process {}: {}", path.display(), e);
+                }
+            }
+        }
+    } else if input_path.is_file() {
+        let output_image = format!("{}_tn.jpg", input_path.to_string_lossy());
+        println!("Processing: {}", input_path.display());
+        create_thumbnail_mosaic(&args[1], &output_image, 3, 3, 9)?;
+    } else {
+        eprintln!("Invalid input path.");
+        std::process::exit(1);
+    }
 
     Ok(())
+}
+
+/// Check if a file is a video based on extension.
+fn is_video_file(path: &Path) -> bool {
+    matches!(
+        path.extension().and_then(|e| e.to_str()).unwrap_or("").to_lowercase().as_str(),
+        "mp4" | "mov" | "avi" | "mkv" | "webm"
+    )
 }
 
 /// Create a thumbnail mosaic from video and overlay metadata text.
@@ -86,29 +128,41 @@ fn create_thumbnail_mosaic(
     total_frames: usize,
 ) -> Result<()> {
     let temp_dir = tempdir()?;
-
-    // === Extract evenly spaced thumbnails ===
     let duration = get_video_duration(video_path)?;
     let interval = duration / total_frames as f64;
 
+    // === Extract evenly spaced thumbnails with retry ===
     for i in 0..total_frames {
-        let timestamp = interval * i as f64;
+        let mut timestamp = interval * i as f64;
+        let max_attempts = 5;
+        let mut attempt = 0;
+
         let output_file = temp_dir.path().join(format!("thumb_{:03}.jpg", i));
         let output_file_str = output_file.to_str().unwrap();
 
-        Command::new("ffmpeg")
-            .args([
-                "-ss", &format!("{:.3}", timestamp),
-                "-i", video_path,
-                "-frames:v", "1",
-                "-q:v", "2",
-                output_file_str,
-            ])
-            .status()
-            .with_context(|| format!("Failed to extract thumbnail at {:.3}s", timestamp))?;
+        loop {
+            Command::new("ffmpeg")
+                .args([
+                    "-ss", &format!("{:.3}", timestamp),
+                    "-i", video_path,
+                    "-frames:v", "1",
+                    "-q:v", "2",
+                    "-y",
+                    output_file_str,
+                ])
+                .status()
+                .with_context(|| format!("Failed to extract thumbnail at {:.3}s", timestamp))?;
+
+            if !is_black_frame(video_path, timestamp)? || attempt >= max_attempts {
+                break;
+            }
+
+            attempt += 1;
+            timestamp += 2.0; // Try 2s later
+        }
     }
 
-    // === Create mosaic image ===
+    // === Create mosaic ===
     let mosaic_temp = temp_dir.path().join("mosaic_raw.jpg");
     let input_pattern = temp_dir.path().join("thumb_%03d.jpg");
 
@@ -118,12 +172,13 @@ fn create_thumbnail_mosaic(
             "-i", input_pattern.to_str().unwrap(),
             "-filter_complex",
             &format!("tile={}x{}", cols, rows),
+            "-y",
             mosaic_temp.to_str().unwrap(),
         ])
         .status()
         .with_context(|| "Failed to create mosaic with ffmpeg")?;
 
-    // === Extract video metadata ===
+    // === Metadata ===
     let ffprobe_output = Command::new("ffprobe")
         .args([
             "-v", "error",
@@ -136,21 +191,12 @@ fn create_thumbnail_mosaic(
         .with_context(|| "Failed to run ffprobe for resolution")?;
 
     let resolution = String::from_utf8_lossy(&ffprobe_output.stdout).trim().to_string();
-    let filename = Path::new(video_path)
-        .file_name()
-        .unwrap()
-        .to_string_lossy();
-
-    let font_path = find_default_font()
-        .ok_or_else(|| anyhow::anyhow!("No usable system font found for drawtext"))?;
-
+    let filename = Path::new(video_path).file_name().unwrap().to_string_lossy();
+    let font_path = find_default_font().ok_or_else(|| anyhow::anyhow!("No usable system font found for drawtext"))?;
     let filesize_mb = get_filesize_mb(video_path)?;
 
-    // === Prepare overlay text ===
-    let raw_text = format!(
-        "File:{} Size:{:.2} MB Resolution:({})",
-        filename, filesize_mb, resolution
-    );
+    // === Text Overlay ===
+    let raw_text = format!("File:{} Size:{:.2} MB Resolution:({})", filename, filesize_mb, resolution);
     let escaped_text = escape_ffmpeg_drawtext_text(&raw_text);
     let escaped_font_path = escape_ffmpeg_drawtext_text(&font_path);
 
@@ -159,7 +205,6 @@ fn create_thumbnail_mosaic(
         escaped_font_path, escaped_text
     );
 
-    // === Apply drawtext overlay ===
     Command::new("ffmpeg")
         .args([
             "-i", mosaic_temp.to_str().unwrap(),
