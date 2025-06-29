@@ -115,7 +115,7 @@ fn main() -> Result<()> {
 fn is_video_file(path: &Path) -> bool {
     matches!(
         path.extension().and_then(|e| e.to_str()).unwrap_or("").to_lowercase().as_str(),
-        "mp4" | "mov" | "avi" | "mkv" | "webm"
+        "mp4" | "mov" | "avi" | "mkv" | "webm" | "m4v" | "wmv" | "mpg" | "mpeg" | "ts"
     )
 }
 
